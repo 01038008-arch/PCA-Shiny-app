@@ -363,6 +363,9 @@ def server(input, output, session):
             return None
         groups = df[gc].astype(str)
         X = df.drop(columns=[gc]).select_dtypes(include=[np.number]).dropna(axis=1)
+        X = X.replace(0, np.nan)
+        X = X.fillna(X.min() / 2)   # 以各 feature 最小值的一半補值
+        X = np.log10(X)
         X_scaled = StandardScaler().fit_transform(X)
         n_comp = min(input.n_components(), X_scaled.shape[0], X_scaled.shape[1])
         pca = PCA(n_components=n_comp)
