@@ -1,7 +1,6 @@
 from shiny import App, ui, render, reactive
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -36,7 +35,35 @@ LOADING_CSS = """
     animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+.err-box {
+    background: #fdf0f0; border: 1px solid #e74c3c; border-radius: 8px;
+    padding: 20px 24px; color: #c0392b; font-size: 14px; line-height: 1.7;
+}
+.warn-box {
+    background: #fffbf0; border: 1px solid #f39c12; border-radius: 6px;
+    padding: 8px 12px; color: #856404; font-size: 12px; margin-top: 4px;
+}
 </style>
+"""
+
+SPINNER_HTML = """
+<div class="plot-loading">
+    <div class="spinner"></div>
+    <span>Loading 中，請稍候…</span>
+</div>
+"""
+
+THEMES_JS = """
+<script>
+document.addEventListener('input', function(e) {
+    var id = e.target.id || '';
+    if (id.startsWith('color_')) {
+        var idx = id.replace('color_','');
+        var prev = document.getElementById('preview_' + idx);
+        if (prev) prev.style.background = e.target.value.trim();
+    }
+});
+</script>
 """
 
 app_ui = ui.page_fluid(
@@ -57,8 +84,6 @@ app_ui = ui.page_fluid(
         td { padding:6px 12px; border-bottom:1px solid #eee; }
         tr:hover { background:#f0f4f8; }
         .table-scroll { max-height:480px; overflow-y:auto; }
-        .dl-btn { background:#27ae60; color:white; padding:7px 16px;
-                  border-radius:5px; text-decoration:none; font-size:13px; }
     """),
 
     ui.div({"class":"title-box"},
@@ -82,13 +107,66 @@ app_ui = ui.page_fluid(
             ui.input_numeric("n_components","PCA 主成分數", value=2, min=2, max=10),
             ui.hr(),
 
+            # ══ 前處理 ══
+            ui.div({"class":"sec"}, "🧪 前處理設定"),
+            ui.p("預設：無歸一化 → half-min補值 → log10轉換 → Auto縮放",
+                 style="font-size:11px; color:#888; line-height:1.5; margin-bottom:6px;"),
+
+            ui.p("一、歸一化 Normalization",
+                 style="font-size:12px; font-weight:600; color:#2c3e50; margin:6px 0 2px 0;"),
+            ui.input_select("norm_method","",
+                choices={
+                    "none":    "無（skip）",
+                    "total":   "Total ion / Constant sum",
+                    "median":  "Median normalization",
+                    "pqn":     "PQN（probabilistic quotient）",
+                    "sample":  "樣品量（輸入數值）",
+                    "is":      "內標準品 IS（選擇 feature 欄）",
+                    "quantile":"Quantile",
+                }, selected="none"),
+            ui.output_ui("norm_extra_ui"),
+
+            ui.p("二、缺失值補法",
+                 style="font-size:12px; font-weight:600; color:#2c3e50; margin:8px 0 2px 0;"),
+            ui.input_select("impute_method","",
+                choices={
+                    "halfmin": "half-min（各 feature 最小值 / 2）",
+                    "lodrt2":  "LOD / √2",
+                    "none":    "無補值（保留 0）",
+                }, selected="halfmin"),
+
+            ui.p("三、轉換 Transformation",
+                 style="font-size:12px; font-weight:600; color:#2c3e50; margin:8px 0 2px 0;"),
+            ui.input_select("transform_method","",
+                choices={
+                    "log10": "log10（預設）",
+                    "log2":  "log2",
+                    "glog":  "glog（generalized log）",
+                    "sqrt":  "平方根（√x）",
+                    "cbrt":  "立方根（∛x）",
+                    "none":  "無轉換",
+                }, selected="log10"),
+            ui.output_ui("glog_ui"),
+
+            ui.p("四、縮放 Scaling",
+                 style="font-size:12px; font-weight:600; color:#2c3e50; margin:8px 0 2px 0;"),
+            ui.input_select("scaling_method","",
+                choices={
+                    "auto":   "Auto / Unit variance（預設）",
+                    "mean":   "Mean centering only",
+                    "pareto": "Pareto",
+                    "vast":   "Vast",
+                    "range":  "Range",
+                    "level":  "Level",
+                }, selected="auto"),
+            ui.hr(),
+
+            # ══ 顏色 ══
             ui.div({"class":"sec"}, "🎨 顏色設定"),
             ui.input_select("color_mode","配色模式",
                 choices={"theme":"主題配色","manual":"手動輸入色號"}),
             ui.output_ui("color_theme_ui"),
             ui.output_ui("color_pickers"),
-
-            # 自訂主題管理
             ui.output_ui("custom_theme_ui"),
             ui.hr(),
 
@@ -103,8 +181,11 @@ app_ui = ui.page_fluid(
             ui.hr(),
 
             ui.div({"class":"sec"}, "🔧 圖表選項"),
+            ui.output_ui("orient_ref_ui"),
             ui.input_checkbox("show_loading_plot","顯示 Loading Plot", value=False),
             ui.input_checkbox("show_ellipse","顯示群組橢圓", value=True),
+            ui.input_checkbox("flip_x","左右翻轉（PC1 反向）", value=False),
+            ui.input_checkbox("flip_y","上下翻轉（PC2 反向）", value=False),
             ui.input_numeric("point_size","點的大小", value=12, min=5, max=30),
             ui.hr(),
 
@@ -155,47 +236,18 @@ app_ui = ui.page_fluid(
             )
         )
     ),
-
-    # 自訂主題資料（隱藏的 JSON 儲存）
     ui.tags.div({"id":"custom_themes_store", "style":"display:none"}, "{}"),
 )
 
-# ── 轉圈 HTML ──
-SPINNER_HTML = """
-<div class="plot-loading">
-    <div class="spinner"></div>
-    <span>Loading 中，請稍候…</span>
-</div>
-"""
-
-THEMES_JS = """
-<script>
-// 自訂主題存在 localStorage
-function saveCustomThemes(obj) {
-    try { localStorage.setItem('pca_custom_themes', JSON.stringify(obj)); } catch(e){}
-}
-function loadCustomThemes() {
-    try { return JSON.parse(localStorage.getItem('pca_custom_themes') || '{}'); } catch(e){ return {}; }
-}
-// 色塊即時預覽
-document.addEventListener('input', function(e) {
-    var id = e.target.id || '';
-    if (id.startsWith('color_')) {
-        var idx = id.replace('color_','');
-        var prev = document.getElementById('preview_' + idx);
-        if (prev) prev.style.background = e.target.value.trim();
-    }
-});
-</script>
-"""
-
+# ══════════════════════════════════════════════════════
+# SERVER
+# ══════════════════════════════════════════════════════
 def server(input, output, session):
 
-    # ── 自訂主題（session 內記憶）──
     custom_themes = reactive.value({})
-    # 色號快取：{ group_name: color }
-    color_cache = reactive.value({})
+    color_cache   = reactive.value({})
 
+    # ── 檔案 / 工作表 ──────────────────────────────
     @reactive.calc
     def file_info():
         f = input.file()
@@ -205,7 +257,7 @@ def server(input, output, session):
         name = f[0]["name"].lower()
         is_excel = name.endswith(".xlsx") or name.endswith(".xls")
         sheets = pd.ExcelFile(path).sheet_names if is_excel else []
-        return {"path":path, "is_excel":is_excel, "sheets":sheets}
+        return {"path": path, "is_excel": is_excel, "sheets": sheets}
 
     @output
     @render.ui
@@ -240,7 +292,271 @@ def server(input, output, session):
             return []
         return list(dict.fromkeys(df[gc].astype(str).tolist()))
 
-    # ── 主題選單（含自訂）──
+    # ── 前處理動態 UI ──────────────────────────────
+    @output
+    @render.ui
+    def norm_extra_ui():
+        m = input.norm_method()
+        if m == "sample":
+            df = loaded_data()
+            n  = "?" if df is None else str(len(df))
+            return ui.div(
+                ui.input_text("sample_weights",
+                    f"樣品量（逗號分隔，共 {n} 個樣本，依列順序）",
+                    placeholder="例：1.2,0.9,1.1,..."),
+                ui.output_ui("sample_weight_warn"),
+                style="margin-top:4px;"
+            )
+        if m == "is":
+            df = loaded_data()
+            if df is None:
+                return ui.p("請先上傳資料", style="font-size:11px;color:#888;")
+            gc   = input.group_col()
+            feats = [c for c in df.columns if c != gc]
+            return ui.div(
+                ui.input_select("is_feature","內標準品欄位（feature 欄）", choices=feats),
+                style="margin-top:4px;"
+            )
+        return ui.div()
+
+    @output
+    @render.ui
+    def sample_weight_warn():
+        if input.norm_method() != "sample":
+            return ui.div()
+        df = loaded_data()
+        if df is None:
+            return ui.div()
+        try:
+            ws_str = input.sample_weights()
+            if not ws_str or not ws_str.strip():
+                return ui.div()
+            ws = [float(w.strip()) for w in ws_str.split(",")]
+            n  = len(df)
+            if len(ws) != n:
+                return ui.HTML(
+                    f'<div class="warn-box">⚠️ 輸入了 {len(ws)} 個數值，但資料有 {n} 個樣本，'
+                    f'歸一化將不會生效。</div>'
+                )
+        except:
+            return ui.HTML('<div class="warn-box">⚠️ 格式錯誤，請輸入逗號分隔的數字。</div>')
+        return ui.div()
+
+    @output
+    @render.ui
+    def glog_ui():
+        if input.transform_method() != "glog":
+            return ui.div()
+        # 嘗試顯示實際 λ
+        pre = preprocessed_X()
+        lam_text = ""
+        if pre is not None and not (isinstance(pre, tuple) and len(pre) == 2 and isinstance(pre[0], str) and pre[0] == "error"):
+            try:
+                X, _, _dropped = pre
+                pos_min = float(np.nanmin(X.values[X.values > 0])) if (X.values > 0).any() else 1.0
+                k = input.glog_k() if input.glog_k() else 1.0
+                lam = k * (pos_min ** 2)
+                lam_text = f"（實際 λ ≈ {lam:.3e}）"
+            except:
+                pass
+        return ui.div(
+            ui.input_numeric("glog_k",
+                f"glog λ 係數（λ = k × 最小正值²，建議 0.1–10）{lam_text}",
+                value=1.0, min=0),
+        )
+
+    # ── 定向參考組 UI ──────────────────────────────
+    @output
+    @render.ui
+    def orient_ref_ui():
+        groups = unique_groups()
+        if not groups:
+            return ui.div()
+        return ui.input_select("orient_ref","定向參考組（固定落在正向）",
+            choices=["（不固定）"] + groups, selected="（不固定）")
+
+    # ── 前處理計算 ─────────────────────────────────
+    @reactive.calc
+    def preprocessed_X():
+        df = loaded_data()
+        if df is None:
+            return None
+        gc = input.group_col()
+        if gc not in df.columns:
+            return None
+
+        # § 6 防呆：無補值 + log 轉換
+        impute = input.impute_method()
+        trans  = input.transform_method()
+        if impute == "none" and trans in ("log10", "log2"):
+            return ("error",
+                "「無補值」不能搭配 log 轉換（log(0) 未定義，補 0 後會產生極端離群值）。\n"
+                "請改用 half-min 補值，或將轉換改為 glog／平方根／立方根。")
+
+        groups_all = df[gc].astype(str)
+        qc_mask  = groups_all.str.upper() == "QC"
+        ana_mask = ~qc_mask
+
+        orig_cols   = df.drop(columns=[gc]).columns
+        X_all = df.drop(columns=[gc]).select_dtypes(include=[np.number])
+        dropped = len(orig_cols) - len(X_all.columns)
+        X_all = X_all.dropna(axis=1)
+
+        norm = input.norm_method()
+        X    = X_all.copy().astype(float)
+
+        # § 1 — Normalization
+        if norm == "total":
+            row_sum = X.sum(axis=1).replace(0, np.nan)
+            X = X.div(row_sum, axis=0)
+
+        elif norm == "median":
+            row_med = X.median(axis=1).replace(0, np.nan)
+            X = X.div(row_med, axis=0)
+
+        elif norm == "pqn":
+            # § 4 fix：先做 total-sum 歸一化
+            row_sum = X.sum(axis=1).replace(0, np.nan)
+            X = X.div(row_sum, axis=0)
+            ref = X[ana_mask].median(axis=0).replace(0, np.nan)
+            quotients = X[ana_mask].div(ref, axis=1)
+            coeff = quotients.median(axis=1).replace(0, np.nan)
+            X.loc[ana_mask] = X[ana_mask].div(coeff, axis=0)
+
+        elif norm == "sample":
+            ws_str = (input.sample_weights() or "").strip()
+            if ws_str:
+                try:
+                    ws  = [float(w.strip()) for w in ws_str.split(",")]
+                    idx = X.index.tolist()
+                    if len(ws) == len(idx):
+                        for i, row_idx in enumerate(idx):
+                            if ws[i] != 0:
+                                X.loc[row_idx] = X.loc[row_idx] / ws[i]
+                except:
+                    pass
+
+        elif norm == "is":
+            # § 1 fix：用 feature 欄做 IS
+            is_col = input.is_feature() if input.is_feature() else None
+            if is_col and is_col in X.columns:
+                denom = X[is_col].replace(0, np.nan)
+                X = X.div(denom, axis=0)
+                X = X.drop(columns=[is_col])
+
+        elif norm == "quantile":
+            # § 2 fix：沿樣本方向、內插並列名次
+            sub = X[ana_mask].astype(float)
+            arr = sub.values
+            ref = np.sort(arr, axis=1).mean(axis=0)
+            rnk = sub.rank(axis=1, method="average").values
+            pos = np.arange(1, arr.shape[1] + 1)
+            out = np.vstack([np.interp(rnk[i], pos, ref)
+                             for i in range(arr.shape[0])])
+            X.loc[ana_mask, :] = out
+
+        # 只保留分析樣本
+        X = X[ana_mask].copy()
+
+        # § 2 — 缺失值補值
+        X = X.replace(0, np.nan)
+        if impute == "halfmin":
+            X = X.fillna(X.min() / 2)
+        elif impute == "lodrt2":
+            X = X.fillna(X.min() / np.sqrt(2))
+        elif impute == "none":
+            X = X.fillna(0)
+
+        # § 3 — Transformation
+        if trans == "log10":
+            X = X.clip(lower=1e-15)
+            X = np.log10(X)
+        elif trans == "log2":
+            X = X.clip(lower=1e-15)
+            X = np.log2(X)
+        elif trans == "glog":
+            # § 5 fix：λ = k × pos_min²
+            pos_vals = X.values[X.values > 0]
+            pos_min  = float(np.nanmin(pos_vals)) if len(pos_vals) > 0 else 1.0
+            k   = input.glog_k() if input.glog_k() else 1.0
+            lam = k * (pos_min ** 2)
+            X   = np.log(X + np.sqrt(X**2 + lam**2))
+        elif trans == "sqrt":
+            X = X.clip(lower=0)
+            X = np.sqrt(X)
+        elif trans == "cbrt":
+            X = np.cbrt(X)
+
+        X = X.replace([np.inf, -np.inf], np.nan).dropna(axis=1, how="all")
+        return X, groups_all[ana_mask].tolist(), dropped
+
+    # ── PCA 計算 ────────────────────────────────────
+    @reactive.calc
+    def run_pca():
+        pre = preprocessed_X()
+        if pre is None:
+            return None
+        if isinstance(pre, tuple) and len(pre) == 2 and isinstance(pre[0], str) and pre[0] == "error":
+            return pre  # 回傳錯誤 tuple
+
+        X, groups, _ = pre
+
+        # § 4 — Scaling
+        scale = input.scaling_method()
+        Xv    = X.values.astype(float)
+        mean  = Xv.mean(axis=0)
+        std   = Xv.std(axis=0, ddof=1)
+        std[std == 0] = 1
+
+        if scale == "auto":
+            X_scaled = (Xv - mean) / std
+        elif scale == "mean":
+            X_scaled = Xv - mean
+        elif scale == "pareto":
+            X_scaled = (Xv - mean) / np.sqrt(std)
+        elif scale == "vast":
+            cv = std / np.where(mean == 0, 1e-15, mean)
+            X_scaled = (Xv - mean) / (std * cv)
+        elif scale == "range":
+            rng = Xv.max(axis=0) - Xv.min(axis=0)
+            rng[rng == 0] = 1
+            X_scaled = (Xv - mean) / rng
+        elif scale == "level":
+            m = np.where(mean == 0, 1e-15, mean)
+            X_scaled = (Xv - mean) / m
+        else:
+            X_scaled = (Xv - mean) / std
+
+        X_scaled = np.nan_to_num(X_scaled, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # § 6 fix：只跑一次完整 PCA，再切片
+        n_max  = min(X_scaled.shape[0], X_scaled.shape[1])
+        n_comp = min(input.n_components(), n_max)
+        pca_full = PCA(n_components=n_max)
+        scores_full = pca_full.fit_transform(X_scaled)
+        scores   = scores_full[:, :n_comp]
+        loadings = pca_full.components_[:n_comp]
+
+        # § 7 — 定向參考組（在 flip 之前）
+        ref_grp = input.orient_ref() if input.orient_ref() else "（不固定）"
+        if ref_grp and ref_grp != "（不固定）":
+            ref_idx = [i for i, g in enumerate(groups) if g == ref_grp]
+            if ref_idx:
+                for k in range(scores.shape[1]):
+                    if np.mean(scores[ref_idx, k]) < 0:
+                        scores[:, k]   *= -1
+                        loadings[k]    *= -1
+
+        return {
+            "scores":       scores,
+            "loadings":     loadings,
+            "explained":    pca_full.explained_variance_ratio_[:n_comp] * 100,
+            "explained_full": pca_full.explained_variance_ratio_ * 100,
+            "groups":       groups,
+            "features":     X.columns.tolist(),
+        }
+
+    # ── 顏色 ────────────────────────────────────────
     @output
     @render.ui
     def color_theme_ui():
@@ -250,7 +566,6 @@ def server(input, output, session):
         return ui.input_select("color_theme","選擇主題",
             choices=list(all_themes.keys()), selected="預設")
 
-    # ── 手動色號（帶快取記憶）──
     @output
     @render.ui
     def color_pickers():
@@ -260,9 +575,8 @@ def server(input, output, session):
         if not groups:
             return ui.p("請先上傳資料", style="font-size:12px;color:#888;")
         cache = color_cache.get()
-        rows = []
+        rows  = []
         for i, grp in enumerate(groups):
-            # 優先用快取，否則預設色
             default = cache.get(grp, DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
             rows.append(ui.div({"class":"color-row"},
                 ui.tags.span({"id":f"preview_{i}", "class":"cprev",
@@ -272,7 +586,6 @@ def server(input, output, session):
             ))
         return ui.div(*rows, ui.HTML(THEMES_JS))
 
-    # ── 自訂主題管理 UI ──
     @output
     @render.ui
     def custom_theme_ui():
@@ -281,10 +594,9 @@ def server(input, output, session):
         ct = custom_themes.get()
         saved_list = (ui.p("（尚無自訂主題）", style="font-size:12px;color:#888;")
                       if not ct else
-                      ui.tags.ul(*[
-                          ui.tags.li(name, style="font-size:12px;")
-                          for name in ct.keys()
-                      ], style="padding-left:16px;margin:4px 0;"))
+                      ui.tags.ul(*[ui.tags.li(n, style="font-size:12px;")
+                                   for n in ct.keys()],
+                                 style="padding-left:16px;margin:4px 0;"))
         return ui.div(
             ui.hr(),
             ui.div({"class":"sec"}, "📌 自訂主題"),
@@ -296,7 +608,6 @@ def server(input, output, session):
             saved_list,
         )
 
-    # ── 儲存自訂主題 ──
     @reactive.effect
     @reactive.event(input.save_theme)
     def _save_theme():
@@ -315,13 +626,12 @@ def server(input, output, session):
         ct[name] = colors
         custom_themes.set(ct)
 
-    # ── 每次手動色號變更時更新快取 ──
     @reactive.effect
     def _update_cache():
         if input.color_mode() != "manual":
             return
         groups = unique_groups()
-        cache = {}
+        cache  = {}
         for i, grp in enumerate(groups):
             try:
                 val = input[f"color_{i}"]()
@@ -333,11 +643,10 @@ def server(input, output, session):
             color_cache.set(cache)
 
     def get_color_map():
-        groups = unique_groups()
+        groups    = unique_groups()
         all_themes = {**COLOR_THEMES, **custom_themes.get()}
         if input.color_mode() == "theme":
-            theme_name = input.color_theme() if input.color_theme() else "預設"
-            palette = all_themes.get(theme_name, DEFAULT_COLORS)
+            palette = all_themes.get(input.color_theme() or "預設", DEFAULT_COLORS)
         else:
             palette = DEFAULT_COLORS
         color_map = {}
@@ -352,65 +661,53 @@ def server(input, output, session):
                 color_map[grp] = palette[i % len(palette)]
         return color_map
 
-    # ── PCA 計算（快取：只在資料/工作表/主成分數改變時重算）──
-    @reactive.calc
-    def run_pca():
-        df = loaded_data()
-        if df is None:
-            return None
-        gc = input.group_col()
-        if gc not in df.columns:
-            return None
-        groups = df[gc].astype(str)
-        X = df.drop(columns=[gc]).select_dtypes(include=[np.number]).dropna(axis=1)
-        X = X.replace(0, np.nan)
-        X = X.fillna(X.min() / 2)   # 以各 feature 最小值的一半補值
-        X = np.log10(X)
-        X_scaled = StandardScaler().fit_transform(X)
-        n_comp = min(input.n_components(), X_scaled.shape[0], X_scaled.shape[1])
-        pca = PCA(n_components=n_comp)
-        scores = pca.fit_transform(X_scaled)
-        pca_full = PCA(n_components=min(X_scaled.shape[0], X_scaled.shape[1]))
-        pca_full.fit(X_scaled)
-        return {
-            "scores": scores,
-            "loadings": pca.components_,
-            "explained": pca.explained_variance_ratio_ * 100,
-            "explained_full": pca_full.explained_variance_ratio_ * 100,
-            "groups": groups.tolist(),
-            "features": X.columns.tolist(),
-        }
+    # ── 錯誤訊息 HTML ───────────────────────────────
+    def error_html(msg):
+        lines = msg.replace("\n","<br>")
+        return ui.HTML(f'<div class="err-box">⚠️ {lines}</div>')
 
+    # ── 圖表建構 ────────────────────────────────────
     def build_pca_fig():
         result = run_pca()
         if result is None:
             return None
-        scores    = result["scores"]
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], str) and result[0] == "error":
+            return result  # 傳遞錯誤
+
+        scores    = result["scores"].copy()
         groups    = result["groups"]
         explained = result["explained"]
-        loadings  = result["loadings"]
+        loadings  = result["loadings"].copy()
         features  = result["features"]
         color_map = get_color_map()
         unique_grps = list(dict.fromkeys(groups))
 
+        # flip（在定向之後）
+        if input.flip_x():
+            scores[:, 0] = -scores[:, 0]
+            loadings[0]  = -loadings[0]
+        if input.flip_y():
+            scores[:, 1] = -scores[:, 1]
+            loadings[1]  = -loadings[1]
+
         fig = go.Figure()
         for grp in unique_grps:
-            idx = [i for i,g in enumerate(groups) if g==grp]
-            x = [scores[i,0] for i in idx]
-            y = [scores[i,1] for i in idx]
+            idx = [i for i, g in enumerate(groups) if g == grp]
+            x = [scores[i, 0] for i in idx]
+            y = [scores[i, 1] for i in idx]
             fig.add_trace(go.Scatter(
                 x=x, y=y, mode="markers", name=grp,
                 marker=dict(size=input.point_size(), color=color_map[grp],
                             line=dict(width=1.5, color="white")),
                 hovertemplate=f"<b>{grp}</b><br>PC1: %{{x:.3f}}<br>PC2: %{{y:.3f}}<extra></extra>"
             ))
-            if input.show_ellipse() and len(idx) >= 3:
-                pts = np.array([[scores[i,0],scores[i,1]] for i in idx])
+            if input.show_ellipse() and len(idx) >= 4:
+                pts  = np.array([[scores[i,0], scores[i,1]] for i in idx])
                 cov  = np.cov(pts.T)
                 mean = pts.mean(axis=0)
                 vals, vecs = np.linalg.eigh(cov)
                 order = vals.argsort()[::-1]
-                vals, vecs = vals[order], vecs[:,order]
+                vals, vecs = vals[order], vecs[:, order]
                 t  = np.linspace(0, 2*np.pi, 100)
                 s  = 2.0
                 ex = mean[0]+s*np.sqrt(vals[0])*np.cos(t)*vecs[0,0]-s*np.sqrt(vals[1])*np.sin(t)*vecs[0,1]
@@ -420,12 +717,12 @@ def server(input, output, session):
                     showlegend=False, hoverinfo="skip"))
 
         if input.show_loading_plot():
-            mag = np.sqrt(loadings[0]**2+loadings[1]**2)
+            mag     = np.sqrt(loadings[0]**2 + loadings[1]**2)
             top_idx = np.argsort(mag)[-10:]
-            sf = max(abs(scores[:,0].max()), abs(scores[:,1].max())) * 0.8
+            sf      = max(abs(scores[:,0].max()), abs(scores[:,1].max())) * 0.8
             for i in top_idx:
                 lx, ly = loadings[0,i]*sf, loadings[1,i]*sf
-                fname = features[i][:18]+"…" if len(features[i])>20 else features[i]
+                fname  = features[i][:18]+"…" if len(features[i]) > 20 else features[i]
                 fig.add_annotation(x=lx, y=ly, text=fname, showarrow=True,
                     arrowhead=2, arrowcolor="#e74c3c",
                     font=dict(size=9, color="#e74c3c"), ax=0, ay=0)
@@ -451,8 +748,8 @@ def server(input, output, session):
 
     def build_scree_fig():
         result = run_pca()
-        if result is None:
-            return None
+        if result is None or (isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], str) and result[0] == "error"):
+            return result
         exp_full = result["explained_full"]
         show_n   = min(15, len(exp_full))
         x_labels = [f"PC{i+1}" for i in range(show_n)]
@@ -479,18 +776,25 @@ def server(input, output, session):
         fig.update_yaxes(title_text="累積變異量 (%)", range=[0,105], secondary_y=True)
         return fig
 
-    # ── 圖表輸出（含轉圈 loading）──
+    # ── 圖表輸出 ────────────────────────────────────
     @output
     @render.ui
     def plot_pca():
         if loaded_data() is None:
             return ui.p("⬅️ 請先上傳資料檔案。",
                         style="color:#888;padding:40px;text-align:center;")
-        # 資料載入中時顯示 spinner
-        if run_pca() is None:
+        pre = preprocessed_X()
+        if pre is None:
             return ui.HTML(SPINNER_HTML)
+        if isinstance(pre, tuple) and len(pre) == 2 and isinstance(pre[0], str) and pre[0] == "error":
+            return error_html(pre[1])
+        result = run_pca()
+        if result is None:
+            return ui.HTML(SPINNER_HTML)
+        if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], str) and result[0] == "error":
+            return error_html(result[1])
         fig = build_pca_fig()
-        if fig is None:
+        if fig is None or (isinstance(fig, tuple) and len(fig) == 2 and isinstance(fig[0], str) and fig[0] == "error"):
             return ui.HTML(SPINNER_HTML)
         return ui.HTML(fig.to_html(include_plotlyjs="cdn", full_html=False))
 
@@ -500,31 +804,68 @@ def server(input, output, session):
         if loaded_data() is None:
             return ui.p("⬅️ 請先上傳資料檔案。",
                         style="color:#888;padding:40px;text-align:center;")
-        if run_pca() is None:
+        pre = preprocessed_X()
+        if pre is None:
             return ui.HTML(SPINNER_HTML)
+        if isinstance(pre, tuple) and len(pre) == 2 and isinstance(pre[0], str) and pre[0] == "error":
+            return error_html(pre[1])
         fig = build_scree_fig()
         if fig is None:
             return ui.HTML(SPINNER_HTML)
+        if isinstance(fig, tuple) and len(fig) == 2 and isinstance(fig[0], str) and fig[0] == "error":
+            return error_html(fig[1])
         return ui.HTML(fig.to_html(include_plotlyjs="cdn", full_html=False))
 
+    # ── 資料資訊 ────────────────────────────────────
     @output
     @render.text
     def data_info():
         df = loaded_data()
         if df is None:
             return "尚未載入資料"
-        info = file_info()
-        gc   = input.group_col()
+        info     = file_info()
+        gc       = input.group_col()
         n_groups = df[gc].nunique() if gc in df.columns else "?"
         n_feat   = len(df.columns) - 1
-        sheet_info = f"\n工作表：{input.sheet()}" if info and info["is_excel"] and input.sheet() else ""
-        return f"樣本數：{len(df)}\n變數數：{n_feat}\n組別數：{n_groups}{sheet_info}"
+        sheet_info = (f"\n工作表：{input.sheet()}"
+                      if info and info["is_excel"] and input.sheet() else "")
 
+        # 顯示被丟棄欄數（建議項 3）
+        dropped_info = ""
+        pre = preprocessed_X()
+        if pre and not (isinstance(pre, tuple) and len(pre) == 2 and isinstance(pre[0], str) and pre[0] == "error"):
+            try:
+                _, _, dropped = pre
+                if dropped > 0:
+                    dropped_info = f"\n⚠️ 丟棄 {dropped} 欄（非數值）"
+            except:
+                pass
+
+        norm_label = {
+            "none":"無","total":"Total ion","median":"Median",
+            "pqn":"PQN","sample":"樣品量","is":"IS","quantile":"Quantile"
+        }.get(input.norm_method(), "")
+        trans_label = {
+            "log10":"log10","log2":"log2","glog":"glog",
+            "sqrt":"√x","cbrt":"∛x","none":"無"
+        }.get(input.transform_method(), "")
+        scale_label = {
+            "auto":"Auto","mean":"Mean centering","pareto":"Pareto",
+            "vast":"Vast","range":"Range","level":"Level"
+        }.get(input.scaling_method(), "")
+
+        return (f"樣本數：{len(df)}\n變數數：{n_feat}\n組別數：{n_groups}"
+                f"{sheet_info}{dropped_info}\n"
+                f"─────────────\n"
+                f"歸一化：{norm_label}\n補值：{input.impute_method()}\n"
+                f"轉換：{trans_label}\n縮放：{scale_label}")
+
+    # ── 解釋變異量表 ────────────────────────────────
     @output
     @render.ui
     def variance_table():
         result = run_pca()
-        if result is None:
+        if result is None or (isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], str) and result[0] == "error"):
             return ui.p("")
         explained = result["explained"]
         rows = ""
@@ -538,6 +879,7 @@ def server(input, output, session):
             <tbody>{rows}</tbody>
         </table>""")
 
+    # ── Table 頁籤 ──────────────────────────────────
     @output
     @render.ui
     def table_raw():
@@ -562,7 +904,7 @@ def server(input, output, session):
     @render.ui
     def table_scores():
         result = run_pca()
-        if result is None:
+        if result is None or (isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], str) and result[0] == "error"):
             return ui.p("尚未載入資料", style="color:#888;padding:20px;")
         scores = result["scores"]
         groups = result["groups"]
